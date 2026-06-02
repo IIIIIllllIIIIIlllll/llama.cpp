@@ -749,10 +749,17 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
     GGML_ASSERT(int64_t(ctx->info.size()) == n_tensors);
 
     // we require the data section to be aligned, so take into account any padding
-    if (n_tensors > 0 && !gr.seek(GGML_PAD(gr.tell(), ctx->alignment))) {
+    // BUT skip the seek when no_alloc=true — no tensor data will be read,
+    // so we don't actually need to reach the data section.
+    if (params.no_alloc) {
+        ctx->offset = GGML_PAD(gr.tell(), ctx->alignment);
+    } else if (n_tensors > 0 && !gr.seek(GGML_PAD(gr.tell(), ctx->alignment))) {
         GGML_LOG_ERROR("%s: failed to seek to beginning of data section\n", __func__);
         gguf_free(ctx);
         return nullptr;
+    } else {
+        // store the current file offset - this is where the data section starts
+        ctx->offset = gr.tell();
     }
 
     // store the current file offset - this is where the data section starts
@@ -763,7 +770,10 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         ctx->size = 0;
         for (size_t i = 0; i < ctx->info.size(); ++i) {
             const gguf_tensor_info & ti = ctx->info[i];
-            if (ti.offset != ctx->size) {
+            // When no_alloc is set, we never read tensor data — allow
+            // non-sequential offsets. This supports metadata-only parsing
+            // of truncated or hand-crafted GGUF files.
+            if (ti.offset != ctx->size && !params.no_alloc) {
                 GGML_LOG_ERROR("%s: tensor '%s' has offset %" PRIu64 ", expected %zu\n",
                     __func__, ti.t.name, ti.offset, ctx->size);
                 GGML_LOG_ERROR("%s: failed to read tensor data\n", __func__);

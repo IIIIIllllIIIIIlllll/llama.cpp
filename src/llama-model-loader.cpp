@@ -579,7 +579,7 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur, no_alloc));
         }
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
@@ -645,7 +645,7 @@ llama_model_loader::llama_model_loader(
                     }
                     n_elements += ggml_nelements(cur);
                     n_bytes    += ggml_nbytes(cur);
-                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur, no_alloc));
                 }
             }
 
@@ -689,7 +689,7 @@ llama_model_loader::llama_model_loader(
             }
             n_elements += ggml_nelements(cur);
             n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur, no_alloc));
         }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
