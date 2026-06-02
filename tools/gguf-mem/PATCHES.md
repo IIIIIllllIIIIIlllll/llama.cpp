@@ -164,6 +164,63 @@ git diff <旧tag> <新tag> -- src/llama-model-loader.cpp
 
 ---
 
+## 编译指南
+
+### Linux（GCC / Clang）
+
+```bash
+# 依赖（Ubuntu/Debian）
+sudo apt install cmake g++ build-essential
+
+# 配置（CPU-only）
+cmake -B build -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON
+
+# 编译 gguf-mem 和 gguf-extract-meta
+cmake --build build -j$(nproc) --target gguf-mem gguf-extract-meta
+
+# 带 CUDA
+cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON
+cmake --build build -j$(nproc) --target gguf-mem gguf-extract-meta
+
+# 带 Vulkan
+cmake -B build -DGGML_VULKAN=ON -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON
+cmake --build build -j$(nproc) --target gguf-mem gguf-extract-meta
+```
+
+### Windows（MSVC）
+
+```powershell
+# 配置
+cmake -B build -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON
+
+# 编译 gguf-mem 和 gguf-extract-meta
+cmake --build build --config Release --target gguf-mem gguf-extract-meta
+```
+
+### 产出
+
+```
+# Linux
+build/bin/gguf-mem
+build/bin/gguf-extract-meta
+
+# Windows
+build/bin/Release/gguf-mem.exe
+build/bin/Release/gguf-extract-meta.exe
+```
+
+### 验证
+
+```bash
+# Linux
+./build/bin/gguf-mem --help
+
+# Windows
+.\build\bin\Release\gguf-mem.exe --help
+```
+
+---
+
 ## 相关文件
 
 ```
