@@ -5120,7 +5120,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
-            return op->src[0]->ne[0] <= 1024;
+        {
+            // bitonic argsort uses one block per row and ncols_pad ints of shared memory
+            int64_t ncols_pad = 1;
+            while (ncols_pad < op->src[0]->ne[0]) {
+                ncols_pad *= 2;
+            }
+            return ncols_pad * (int64_t) sizeof(int) <= (int64_t) ggml_cuda_info().devices[dev_ctx->device].smpb;
+        }
 #else
             return true;
 #endif
