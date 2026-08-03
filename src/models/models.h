@@ -1105,6 +1105,15 @@ struct llama_model_deepseek4 : public llama_model_base {
     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void post_load_tensors(llama_model_loader & ml) override;
+
+    // bookkeeping for runtime-merged dense projection groups (see deepseek4.cpp)
+    struct dsv4_merge_group {
+        ggml_tensor * merged = nullptr;
+        std::vector<std::string> src_names; // GGUF tensor names, in slice order
+        std::vector<int64_t>     src_ne1;   // rows per source tensor
+    };
+    std::vector<dsv4_merge_group> dsv4_merge_groups;
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params) : llm_graph_context(params) {}
@@ -1181,6 +1190,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * qr,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
+                ggml_tensor * attn_merged_b_out,
                 int il) const;
 
         ggml_tensor * build_top_k_mask(
@@ -1199,6 +1209,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 ggml_tensor * sinks,
+                ggml_tensor * attn_merged_b_out,
                 float kq_scale,
                 int il) const;
 
@@ -1226,6 +1237,12 @@ struct llama_model_deepseek4 : public llama_model_base {
 
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
+                int il) const;
+
+        // shared-expert FFN; uses the runtime-merged [gate, up] projection when available
+        ggml_tensor * build_ffn_shexp(
+                ggml_tensor * cur,
+                const llama_layer & layer,
                 int il) const;
     };
 

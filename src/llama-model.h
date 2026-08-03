@@ -485,6 +485,12 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
 
+    // DeepSeek-V4 runtime-merged dense projections (optional, concatenated at load time, see deepseek4.cpp)
+    // when set, the corresponding separate weights above are nullptr
+    struct ggml_tensor * attn_merged_a = nullptr; // [wq_a, wkv, (indexer_proj, comp_wkv, comp_wgate, lid_comp_wkv, lid_comp_wgate)]
+    struct ggml_tensor * attn_merged_b = nullptr; // [wq_b, indexer_attn_q_b] (CSA layers only)
+    struct ggml_tensor * ffn_gate_up_shexp_merged = nullptr; // [ffn_gate_shexp, ffn_up_shexp]
+
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
     struct ggml_tensor * visexp_attn_wo   = nullptr;
@@ -719,6 +725,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_NOT_REQUIRED;
     const int TENSOR_SKIP;
     const int TENSOR_SKIP_IF_VIRTUAL;
+    const int TENSOR_SKIP_QUIET;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
@@ -727,6 +734,11 @@ struct llama_model_base : public llama_model {
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // create a weight tensor that is not present in the model file (e.g. a runtime-merged tensor);
+    // returns nullptr on failure (caller should fall back to regular tensors)
+    ggml_tensor * create_tensor_synthetic(llama_model_loader & ml, llm_tensor tn_tensor, int bid,
+            const std::string & name, ggml_type type, const std::vector<int64_t> & ne);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
@@ -741,6 +753,9 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    // called by load_tensors() after all tensor data has been loaded; default does nothing
+    virtual void post_load_tensors(llama_model_loader & ml);
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

@@ -1655,6 +1655,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // let the model implementation post-process the loaded tensors (e.g. fill runtime-merged weights)
+    post_load_tensors(ml);
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
@@ -1669,6 +1672,17 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_tensor_synthetic(llama_model_loader & ml, llm_tensor tn_tensor, int bid,
+        const std::string & name, ggml_type type, const std::vector<int64_t> & ne) {
+    GGML_ASSERT(bid >= 0);
+    return ml.create_tensor_synthetic(hparams, pimpl->dev_layer.at(bid).buft_list, tn_tensor, name, type, ne);
+}
+
+void llama_model_base::post_load_tensors(llama_model_loader & ml) {
+    // default: nothing to do
+    GGML_UNUSED(ml);
 }
 
 std::string llama_model::arch_name() const {
@@ -2858,7 +2872,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_DUPLICATED     (llama_model_loader::TENSOR_DUPLICATED),
     TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
-    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL) {}
+    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
+    TENSOR_SKIP_QUIET     (llama_model_loader::TENSOR_SKIP_QUIET) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);

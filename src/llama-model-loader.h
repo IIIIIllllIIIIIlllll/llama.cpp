@@ -67,6 +67,7 @@ struct llama_model_loader {
     static const int TENSOR_DUPLICATED      = 1 << 1;
     static const int TENSOR_SKIP            = 1 << 2;
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
+    static const int TENSOR_SKIP_QUIET      = 1 << 4; // like TENSOR_SKIP, but without the "unused tensor" warning
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -182,6 +183,15 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // create a repeating-layer weight tensor that is not present in the model file (e.g. a runtime-merged tensor).
+    // the buffer type is selected as if it were a tensor of kind `tn_tensor`; does not count towards n_created.
+    // returns nullptr if a synthetic tensor cannot be created (caller should fall back to regular tensors).
+    struct ggml_tensor * create_tensor_synthetic(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
+        llm_tensor tn_tensor, const std::string & name, ggml_type type, const std::vector<int64_t> & ne);
+
+    struct ggml_context * ctx_for_buft(const llama_hparams & hparams, ggml_backend_buffer_type_t buft);
 
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 

@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <regex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     if (ext_factor == 0.0f) {
@@ -13,6 +15,186 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     }
 
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
+}
+
+static constexpr int64_t DSV4_CSA_RATIO = 4;
+static constexpr int64_t DSV4_HCA_RATIO = 128;
+
+//
+// runtime-merged dense projections ("merged GEMV"):
+// several projection matrices that share the same input are concatenated along ne1 at load time
+// into a single synthetic weight tensor, so the forward graph issues one ggml_mul_mat instead of
+// one per projection. the source tensors keep their GGUF layout - the merge is fully optional and
+// falls back to the separate tensors whenever the preconditions are not met.
+//
+
+struct dsv4_merge_src {
+    llm_tensor kind; // tensor kind, used for the GGUF name and the buffer type selection
+    int64_t    ne1;  // rows contributed to the merged tensor
+    int64_t    off;  // row offset in the merged tensor (filled by dsv4_merge_layout)
+};
+
+static void dsv4_merge_layout(std::vector<dsv4_merge_src> & srcs) {
+    int64_t off = 0;
+    for (auto & src : srcs) {
+        src.off = off;
+        off += src.ne1;
+    }
+}
+
+// group A: projections that consume the attn_norm output (cur).
+// wq_a and indexer.proj are intentionally not merged: in practice wq_a uses a different
+// quantization type than the other projections (e.g. Q6_K vs Q8_0) and indexer.proj is a tiny
+// F32 tensor, so they are always loaded as separate weights (see dsv4_try_merge_group).
+static std::vector<dsv4_merge_src> dsv4_merge_group_a_sources(const llama_hparams & hparams, int64_t ratio) {
+    const int64_t n_embd_head = hparams.n_embd_head_k();
+
+    std::vector<dsv4_merge_src> srcs = {
+        { LLM_TENSOR_ATTN_KV,  n_embd_head,      0 },
+    };
+    if (ratio == DSV4_CSA_RATIO) {
+        srcs.push_back({ LLM_TENSOR_ATTN_COMPRESSOR_WKV,      2*n_embd_head,                 0 });
+        srcs.push_back({ LLM_TENSOR_ATTN_COMPRESSOR_WGATE,    2*n_embd_head,                 0 });
+        srcs.push_back({ LLM_TENSOR_INDEXER_COMPRESSOR_WKV,   2*hparams.indexer_head_size,   0 });
+        srcs.push_back({ LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, 2*hparams.indexer_head_size,   0 });
+    } else if (ratio == DSV4_HCA_RATIO) {
+        srcs.push_back({ LLM_TENSOR_ATTN_COMPRESSOR_WKV,      n_embd_head,                   0 });
+        srcs.push_back({ LLM_TENSOR_ATTN_COMPRESSOR_WGATE,    n_embd_head,                   0 });
+    }
+    dsv4_merge_layout(srcs);
+    return srcs;
+}
+
+// group B: projections that consume the rms_norm(wq_a) output (qr); CSA layers only
+static std::vector<dsv4_merge_src> dsv4_merge_group_b_sources(const llama_hparams & hparams, int64_t ratio) {
+    std::vector<dsv4_merge_src> srcs;
+    if (ratio == DSV4_CSA_RATIO) {
+        srcs.push_back({ LLM_TENSOR_ATTN_Q_B,         hparams.n_head()*hparams.n_embd_head_k(),        0 });
+        srcs.push_back({ LLM_TENSOR_INDEXER_ATTN_Q_B, hparams.indexer_n_head*hparams.indexer_head_size, 0 });
+    }
+    dsv4_merge_layout(srcs);
+    return srcs;
+}
+
+// group C: shared-expert gate + up projections that consume the ffn_norm output (cur2)
+static std::vector<dsv4_merge_src> dsv4_merge_group_c_sources(const llama_hparams & hparams) {
+    const int64_t n_ff_shexp = hparams.n_ff_exp*hparams.n_expert_shared;
+
+    std::vector<dsv4_merge_src> srcs = {
+        { LLM_TENSOR_FFN_GATE_SHEXP, n_ff_shexp, 0 },
+        { LLM_TENSOR_FFN_UP_SHEXP,   n_ff_shexp, 0 },
+    };
+    dsv4_merge_layout(srcs);
+    return srcs;
+}
+
+// try to create a merged tensor for `srcs`; on success returns true, stores the merged tensor in
+// `out_merged`, accounts for the source tensors as TENSOR_SKIP (their data is gathered into the
+// merged tensor in post_load_tensors), and leaves the corresponding llama_layer members nullptr.
+// on any precondition failure returns false and the caller creates the separate tensors as usual.
+static bool dsv4_try_merge_group(
+        llama_model_deepseek4 & model,
+        llama_model_loader & ml,
+        int bid,
+        const char * merged_name_suffix,
+        const std::vector<dsv4_merge_src> & srcs,
+        int flags,
+        ggml_tensor ** out_merged) {
+    *out_merged = nullptr;
+
+    // log the reason for not merging at DEBUG level (useful to diagnose quantization-type mismatches)
+    #define DSV4_MERGE_FAIL(reason, ...) \
+        do { LLAMA_LOG_DEBUG("%s: not merging %s (layer %d): " reason "\n", __func__, merged_name_suffix, bid, ##__VA_ARGS__); return false; } while (0)
+
+    if (srcs.size() < 2) {
+        DSV4_MERGE_FAIL("fewer than 2 sources");
+    }
+    // merging requires gathering the source data at load time: not possible with mmap (read-only
+    // mapped weights) or without files (set_tensor_data callback loads by tensor name)
+    if (ml.use_mmap || ml.files.empty()) {
+        DSV4_MERGE_FAIL("use_mmap=%d files=%zu", (int) ml.use_mmap, ml.files.size());
+    }
+    if (flags & llama_model_loader::TENSOR_SKIP) {
+        DSV4_MERGE_FAIL("TENSOR_SKIP flag set");
+    }
+
+    const auto & tn = model.tn;
+
+    ggml_type type  = GGML_TYPE_COUNT;
+    int64_t   ne0   = -1;
+    for (const auto & src : srcs) {
+        const std::string name = tn(src.kind, "weight", bid).str();
+
+        const ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
+        if (meta == nullptr) {
+            DSV4_MERGE_FAIL("no meta for %s", name.c_str());
+        }
+        if (meta->ne[1] != src.ne1 || meta->ne[2] != 1 || meta->ne[3] != 1) {
+            DSV4_MERGE_FAIL("%s shape mismatch: expected ne1=%d got [%d %d %d %d]", name.c_str(),
+                    (int) src.ne1, (int) meta->ne[0], (int) meta->ne[1], (int) meta->ne[2], (int) meta->ne[3]);
+        }
+        if (type == GGML_TYPE_COUNT) {
+            type = meta->type;
+            ne0  = meta->ne[0];
+        } else if (meta->type != type || meta->ne[0] != ne0) {
+            // can only concatenate rows of the same type and row length
+            DSV4_MERGE_FAIL("%s type/ne0 mismatch: %s ne0=%d vs %s ne0=%d", name.c_str(),
+                    ggml_type_name(meta->type), (int) meta->ne[0], ggml_type_name(type), (int) ne0);
+        }
+        // per-source NVFP4 sidecar scales cannot be represented in a merged tensor
+        if (ml.get_tensor_meta(tn(src.kind, "scale", bid).str().c_str()) != nullptr) {
+            DSV4_MERGE_FAIL("%s has a scale sidecar", name.c_str());
+        }
+        if (ml.get_tensor_meta(tn(src.kind, "input_scale", bid).str().c_str()) != nullptr) {
+            DSV4_MERGE_FAIL("%s has an input_scale sidecar", name.c_str());
+        }
+        // honor user tensor buffer overrides (-ot) on the original tensor names by not merging
+        if (ml.tensor_buft_overrides) {
+            for (const auto * ov = ml.tensor_buft_overrides; ov->pattern != nullptr; ++ov) {
+                if (std::regex_search(name, std::regex(ov->pattern))) {
+                    DSV4_MERGE_FAIL("%s matched by an -ot override", name.c_str());
+                }
+            }
+        }
+    }
+
+    const std::string merged_name = "blk." + std::to_string(bid) + "." + merged_name_suffix + ".weight";
+    if (ml.get_weight(merged_name.c_str()) != nullptr) {
+        // paranoia: the merged name must not collide with a real tensor in the model file
+        DSV4_MERGE_FAIL("name collision with a real tensor");
+    }
+
+    const int64_t total_ne1 = srcs.back().off + srcs.back().ne1;
+
+    ggml_tensor * merged = model.create_tensor_synthetic(ml, srcs[0].kind, bid, merged_name, type, { ne0, total_ne1 });
+    if (merged == nullptr) {
+        DSV4_MERGE_FAIL("create_tensor_synthetic returned nullptr");
+    }
+
+    // account for the source tensors without creating them; the data is gathered into the merged
+    // tensor in post_load_tensors
+    for (const auto & src : srcs) {
+        ggml_tensor * skipped = model.create_tensor(ml, tn(src.kind, "weight", bid), { ne0, src.ne1 },
+                flags | llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_SKIP_QUIET);
+        GGML_ASSERT(skipped == nullptr);
+        GGML_UNUSED(skipped);
+    }
+
+    llama_model_deepseek4::dsv4_merge_group group;
+    group.merged = merged;
+    for (const auto & src : srcs) {
+        group.src_names.push_back(tn(src.kind, "weight", bid).str());
+        group.src_ne1.push_back(src.ne1);
+    }
+    model.dsv4_merge_groups.push_back(std::move(group));
+
+    LLAMA_LOG_INFO("%s: merged %zu projections into %s (%d x %d, %s), saving %zu GEMV launch(es) per token\n",
+            __func__, srcs.size(), merged_name.c_str(), (int) ne0, (int) total_ne1, ggml_type_name(type), srcs.size() - 1);
+
+    *out_merged = merged;
+    return true;
+
+    #undef DSV4_MERGE_FAIL
 }
 
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
@@ -109,10 +291,7 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
 
         layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, flags);
         layer.attn_sinks    = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,    "weight", i), {n_head}, flags);
-        layer.wq_a          = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank}, flags);
         layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank}, flags);
-        layer.wq_b          = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head * n_embd_head}, flags);
-        layer.wkv           = create_tensor(tn(LLM_TENSOR_ATTN_KV,       "weight", i), {n_embd, n_embd_head}, flags);
         layer.attn_kv_norm  = create_tensor(tn(LLM_TENSOR_ATTN_KV_NORM,  "weight", i), {n_embd_head}, flags);
         layer.wo_a          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,    "weight", i), {n_head * n_embd_head / o_groups, o_lora_rank * o_groups}, flags);
         layer.wo_b          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,    "weight", i), {o_groups * o_lora_rank, n_embd}, flags);
@@ -125,27 +304,57 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, flags);
 
         const int64_t ratio = hparams.dsv4_compress_ratios[i];
+
+        // wq_a and indexer.proj are always separate weights (see dsv4_merge_group_a_sources)
+        layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), {n_embd, q_lora_rank}, flags);
+        if (ratio == 4) {
+            layer.indexer_proj = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ, "weight", i), {n_embd, hparams.indexer_n_head}, flags);
+        }
+
+        // group A: projections sharing the attn_norm output (cur) — merged into one GEMV when possible
+        if (!dsv4_try_merge_group(*this, ml, i, "attn_merged_a", dsv4_merge_group_a_sources(hparams, ratio), flags, &layer.attn_merged_a)) {
+            layer.wkv  = create_tensor(tn(LLM_TENSOR_ATTN_KV,  "weight", i), {n_embd, n_embd_head}, flags);
+
+            if (ratio != 0) {
+                const int64_t coff = ratio == 4 ? 2 : 1;
+
+                layer.attn_comp_wkv   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * n_embd_head}, flags);
+                layer.attn_comp_wgate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * n_embd_head}, flags);
+
+                if (ratio == 4) {
+                    const int64_t n_embd_indexer = hparams.indexer_head_size;
+
+                    layer.indexer_comp_wkv   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WKV,   "weight", i), {n_embd, 2 * n_embd_indexer}, flags);
+                    layer.indexer_comp_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, 2 * n_embd_indexer}, flags);
+                }
+            }
+        }
+
         if (ratio != 0) {
             const int64_t coff = ratio == 4 ? 2 : 1;
 
-            layer.attn_comp_wkv   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * n_embd_head}, flags);
-            layer.attn_comp_wgate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * n_embd_head}, flags);
             layer.attn_comp_ape   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_APE,   "weight", i), {coff * n_embd_head, ratio}, flags);
             layer.attn_comp_norm  = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM,  "weight", i), {n_embd_head}, flags);
 
             if (ratio == 4) {
                 const int64_t n_embd_indexer = hparams.indexer_head_size;
 
-                layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, flags);
-                layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * n_embd_indexer}, flags);
+                // group B: wq_b + indexer_attn_q_b share the rms_norm(wq_a) output (qr) — CSA layers only
+                if (!dsv4_try_merge_group(*this, ml, i, "attn_merged_b", dsv4_merge_group_b_sources(hparams, ratio), flags, &layer.attn_merged_b)) {
+                    layer.wq_b             = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,         "weight", i), {q_lora_rank, n_head * n_embd_head}, flags);
+                    layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * n_embd_indexer}, flags);
+                }
 
-                layer.indexer_comp_wkv   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WKV,   "weight", i), {n_embd, 2 * n_embd_indexer}, flags);
-                layer.indexer_comp_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, 2 * n_embd_indexer}, flags);
                 layer.indexer_comp_ape   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_APE,   "weight", i), {2 * n_embd_indexer, ratio}, flags);
                 layer.indexer_comp_norm  = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_NORM,  "weight", i), {n_embd_indexer}, flags);
             } else if (ratio != 128) {
                 throw std::runtime_error("DeepSeek-V4 loader only supports compression ratios 0, 4, and 128");
             }
+        }
+
+        // wq_b on its own does not benefit from merging (raw/HCA layers); CSA layers create it via group B above
+        if (ratio != 4) {
+            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), {q_lora_rank, n_head * n_embd_head}, flags);
         }
 
         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, flags);
@@ -160,9 +369,13 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
 
-        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, flags);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, flags);
-        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, flags);
+
+        // group C: shared-expert gate + up projections sharing the ffn_norm output (cur2)
+        if (!dsv4_try_merge_group(*this, ml, i, "ffn_merged_gate_up_shexp", dsv4_merge_group_c_sources(hparams), flags, &layer.ffn_gate_up_shexp_merged)) {
+            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, flags);
+            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, flags);
+        }
 
         if (i >= n_layer) {
             layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", i), {2 * n_embd, n_embd}, flags);
@@ -172,6 +385,44 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), {n_embd, n_vocab},    TENSOR_NOT_REQUIRED | flags);
             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd},             TENSOR_NOT_REQUIRED | flags);
         }
+    }
+}
+
+void llama_model_deepseek4::post_load_tensors(llama_model_loader & ml) {
+    if (dsv4_merge_groups.empty()) {
+        return;
+    }
+
+    // gather the source tensor data into the runtime-merged tensors (see load_arch_tensors)
+    GGML_ASSERT(!ml.use_mmap && !ml.files.empty());
+
+    for (const auto & group : dsv4_merge_groups) {
+        ggml_tensor * merged = group.merged;
+        const size_t row_size = ggml_row_size(merged->type, merged->ne[0]);
+
+        int64_t off = 0;
+        for (size_t j = 0; j < group.src_names.size(); ++j) {
+            const ggml_tensor * meta = ml.get_tensor_meta(group.src_names[j].c_str());
+            GGML_ASSERT(meta != nullptr);
+            GGML_ASSERT(meta->type == merged->type);
+            GGML_ASSERT(meta->ne[0] == merged->ne[0]);
+            GGML_ASSERT(meta->ne[1] == group.src_ne1[j]);
+            GGML_ASSERT(meta->ne[2] == 1 && meta->ne[3] == 1);
+
+            // rows of quantized types are independent, so concatenation along ne1 is a plain copy
+            std::vector<uint8_t> host(row_size*group.src_ne1[j]);
+
+            ggml_tensor staging = *meta;
+            staging.data = host.data();
+            ml.load_data_for(&staging);
+
+            ggml_backend_tensor_set(merged, host.data(), off*row_size, group.src_ne1[j]*row_size);
+            off += group.src_ne1[j];
+        }
+        GGML_ASSERT(off == merged->ne[1]);
+
+        LLAMA_LOG_DEBUG("%s: filled merged tensor %s from %zu source tensors\n",
+                __func__, ggml_get_name(merged), group.src_names.size());
     }
 }
 
@@ -197,6 +448,25 @@ static ggml_tensor * dsv4_view_2d(
         int64_t        ne1,
         int64_t        i0) {
     return ggml_view_2d(ctx, t, ne0, ne1, t->nb[1], dsv4_elem_offset(t, i0));
+}
+
+// slice the rows of a merged projection result that belong to the projection of kind `kind`
+// (see dsv4_try_merge_group); `merged_out` is the [sum(ne1), n_tokens] result of one ggml_mul_mat.
+// the row slice is strided (nb[1] = sum(ne1)*4), but downstream ops (norm, reshape, rope, glu, ...)
+// require contiguous inputs, so the slice is materialized with ggml_cont.
+static ggml_tensor * dsv4_merge_view(
+        ggml_context * ctx,
+        ggml_tensor  * merged_out,
+        const std::vector<dsv4_merge_src> & srcs,
+        llm_tensor    kind,
+        int64_t       nt) {
+    for (const auto & src : srcs) {
+        if (src.kind == kind) {
+            return ggml_cont(ctx, dsv4_view_2d(ctx, merged_out, src.ne1, nt, src.off));
+        }
+    }
+    GGML_ABORT("%s: projection %d not present in the merged group", __func__, (int) kind);
+    return nullptr;
 }
 
 static ggml_tensor * dsv4_append_zero_row(ggml_context * ctx, ggml_tensor * t, bool neg_inf) {
@@ -255,9 +525,6 @@ static dsv4_state_tensors dsv4_build_state_snapshot(
 
     return { kv, score };
 }
-
-static constexpr int64_t DSV4_CSA_RATIO  = 4;
-static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
 // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
 static ggml_tensor * dsv4_hc_mean(ggml_context * ctx, ggml_tensor * x) {
@@ -609,6 +876,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         ggml_tensor * qr,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
+        ggml_tensor * attn_merged_b_out,
         int il) const {
     const auto & layer = model.layers[il];
     const auto & inp_lid = inp_dsv4->get_lid();
@@ -622,7 +890,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     GGML_ASSERT(inp_lid.k_rot);
     GGML_ASSERT(n_embd_indexer_head >= n_embd_indexer_head_rope);
 
-    ggml_tensor * indexer_q = build_lora_mm(layer.indexer_attn_q_b, qr);
+    ggml_tensor * indexer_q = nullptr;
+    if (attn_merged_b_out) {
+        indexer_q = dsv4_merge_view(ctx0, attn_merged_b_out, dsv4_merge_group_b_sources(hparams, hparams.dsv4_compress_ratios[il]),
+                LLM_TENSOR_INDEXER_ATTN_Q_B, nt);
+    } else {
+        indexer_q = build_lora_mm(layer.indexer_attn_q_b, qr);
+    }
     indexer_q = ggml_reshape_3d(ctx0, indexer_q, n_embd_indexer_head, n_indexer_head, nt);
     cb(indexer_q, "lid_q", il);
 
@@ -739,12 +1013,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         ggml_tensor * sinks,
+        ggml_tensor * attn_merged_b_out,
         float kq_scale,
         int il) const {
     const auto & inp_csa = inp_dsv4->get_csa();
     GGML_ASSERT(inp_csa.kq_mask);
 
-    ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il);
+    ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, attn_merged_b_out, il);
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
     if (k_rot) {
@@ -932,13 +1207,33 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     const float beta_slow_l      = use_compress_rope ? beta_slow : 0.0f;
     const int32_t n_ctx_orig_l   = use_compress_rope ? n_ctx_orig : 0;
 
+    const int64_t ratio = hparams.dsv4_compress_ratios[il];
+
+    // runtime-merged dense projections: one GEMV for all projections sharing the same input
+    // (see dsv4_try_merge_group); falls back to the separate weights when a group was not merged
+    ggml_tensor * attn_merged_a_out = nullptr;
+    ggml_tensor * attn_merged_b_out = nullptr;
+    std::vector<dsv4_merge_src> group_a;
+    if (layer.attn_merged_a) {
+        group_a = dsv4_merge_group_a_sources(hparams, ratio);
+        attn_merged_a_out = build_lora_mm(layer.attn_merged_a, cur);
+        cb(attn_merged_a_out, "attn_merged_a", il);
+    }
+
     ggml_tensor * qr = build_lora_mm(layer.wq_a, cur);
     cb(qr, "qr", il);
 
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "qr_norm", il);
 
-    ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
+    ggml_tensor * q = nullptr;
+    if (layer.attn_merged_b) {
+        attn_merged_b_out = build_lora_mm(layer.attn_merged_b, qr);
+        cb(attn_merged_b_out, "attn_merged_b", il);
+        q = dsv4_merge_view(ctx0, attn_merged_b_out, dsv4_merge_group_b_sources(hparams, ratio), LLM_TENSOR_ATTN_Q_B, nt);
+    } else {
+        q = build_lora_mm(layer.wq_b, qr);
+    }
     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
     q = ggml_rms_norm(ctx0, q, norm_rms_eps);
     cb(q, "q_norm", il);
@@ -957,7 +1252,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     q = ggml_concat(ctx0, q_nope, q_pe, 0);
     cb(q, "q", il);
 
-    ggml_tensor * kv = build_lora_mm(layer.wkv, cur);
+    ggml_tensor * kv = attn_merged_a_out
+        ? dsv4_merge_view(ctx0, attn_merged_a_out, group_a, LLM_TENSOR_ATTN_KV, nt)
+        : build_lora_mm(layer.wkv, cur);
     kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
     kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt);
     cb(kv, "kv_norm", il);
@@ -976,7 +1273,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     kv = ggml_concat(ctx0, kv_nope, kv_pe, 0);
     cb(kv, "kv", il);
 
-    const int64_t ratio = hparams.dsv4_compress_ratios[il];
     GGML_ASSERT(inp_dsv4 || ratio == 0);
 
     ggml_tensor * hca_state_kv    = nullptr;
@@ -984,10 +1280,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     ggml_tensor * hca_source_kv   = nullptr;
     ggml_tensor * hca_source_score = nullptr;
     if (ratio == DSV4_HCA_RATIO && inp_dsv4->get_hca().state_pos) {
-        hca_state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
+        if (attn_merged_a_out) {
+            hca_state_kv = dsv4_merge_view(ctx0, attn_merged_a_out, group_a, LLM_TENSOR_ATTN_COMPRESSOR_WKV, nt);
+        } else {
+            hca_state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
+        }
         cb(hca_state_kv, "hca_state_kv", il);
 
-        hca_state_score = build_lora_mm(layer.attn_comp_wgate, cur);
+        if (attn_merged_a_out) {
+            hca_state_score = dsv4_merge_view(ctx0, attn_merged_a_out, group_a, LLM_TENSOR_ATTN_COMPRESSOR_WGATE, nt);
+        } else {
+            hca_state_score = build_lora_mm(layer.attn_comp_wgate, cur);
+        }
         cb(hca_state_score, "hca_state_score", il);
 
         ggml_tensor * ape = layer.attn_comp_ape;
@@ -999,10 +1303,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     }
 
     if (ratio == DSV4_CSA_RATIO && inp_dsv4->get_csa().state_pos) {
-        ggml_tensor * csa_state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
+        ggml_tensor * csa_state_kv = attn_merged_a_out
+            ? dsv4_merge_view(ctx0, attn_merged_a_out, group_a, LLM_TENSOR_ATTN_COMPRESSOR_WKV, nt)
+            : build_lora_mm(layer.attn_comp_wkv, cur);
         cb(csa_state_kv, "csa_state_kv", il);
 
-        ggml_tensor * csa_state_score = build_lora_mm(layer.attn_comp_wgate, cur);
+        ggml_tensor * csa_state_score = attn_merged_a_out
+            ? dsv4_merge_view(ctx0, attn_merged_a_out, group_a, LLM_TENSOR_ATTN_COMPRESSOR_WGATE, nt)
+            : build_lora_mm(layer.attn_comp_wgate, cur);
         cb(csa_state_score, "csa_state_score", il);
 
         ggml_tensor * csa_ape = layer.attn_comp_ape;
@@ -1068,10 +1376,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_build_forward_expand(gf, csa_state_kv);
         ggml_build_forward_expand(gf, csa_state_score);
 
-        ggml_tensor * lid_state_kv = build_lora_mm(layer.indexer_comp_wkv, cur);
+        ggml_tensor * lid_state_kv = attn_merged_a_out
+            ? dsv4_merge_view(ctx0, attn_merged_a_out, group_a, LLM_TENSOR_INDEXER_COMPRESSOR_WKV, nt)
+            : build_lora_mm(layer.indexer_comp_wkv, cur);
         cb(lid_state_kv, "lid_state_kv", il);
 
-        ggml_tensor * lid_state_score = build_lora_mm(layer.indexer_comp_wgate, cur);
+        ggml_tensor * lid_state_score = attn_merged_a_out
+            ? dsv4_merge_view(ctx0, attn_merged_a_out, group_a, LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, nt)
+            : build_lora_mm(layer.indexer_comp_wgate, cur);
         cb(lid_state_score, "lid_state_score", il);
 
         ggml_tensor * lid_ape = layer.indexer_comp_ape;
@@ -1232,6 +1544,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
             inp_dsv4->get_lid().kq_mask &&
             inp_dsv4->get_lid().k_rot) {
         out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
+                attn_merged_b_out,
                 1.0f/sqrtf(float(n_embd_head)), il);
     } else if (ratio == DSV4_HCA_RATIO &&
             inp_dsv4->get_hca().kq_mask) {
@@ -1267,6 +1580,56 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     cb(out, "attn_out", il);
 
     return out;
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_ffn_shexp(
+        ggml_tensor * cur,
+        const llama_layer & layer,
+        int il) const {
+    if (layer.ffn_gate_up_shexp_merged == nullptr) {
+        return build_ffn(cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+    }
+
+    const int64_t n_ff = layer.ffn_down_shexp->ne[0]; // n_ff_exp * n_expert_shared
+    const int64_t nt   = cur->ne[1];
+
+    // one GEMV for [gate, up]; the logic below mirrors llm_graph_context::build_ffn
+    // with LLM_FFN_SILU + LLM_FFN_PAR for LLM_ARCH_DEEPSEEK4
+    ggml_tensor * gate_up = build_lora_mm(layer.ffn_gate_up_shexp_merged, cur);
+    cb(gate_up, "ffn_gate_up_shexp", il);
+
+    // the row slices are strided views; materialize them (clamp/glu require contiguous inputs)
+    ggml_tensor * tmp = ggml_cont(ctx0, dsv4_view_2d(ctx0, gate_up, n_ff, nt, n_ff)); // up
+    cb(tmp, "ffn_up", il);
+
+    cur = ggml_cont(ctx0, dsv4_view_2d(ctx0, gate_up, n_ff, nt, 0)); // gate
+    cb(cur, "ffn_gate", il);
+
+    if (il >= 0) {
+        const float limit = hparams.swiglu_clamp_shexp[il];
+        constexpr float eps = 1e-6f;
+        if (limit > eps) {
+            tmp = ggml_clamp(ctx0, tmp, -limit, limit);
+            cb(tmp, "ffn_up_clamped", il);
+
+            cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+            cb(cur, "ffn_gate_clamped", il);
+
+            cur = ggml_swiglu_split(ctx0, cur, tmp);
+            cb(cur, "ffn_swiglu_limited", il);
+
+            return build_lora_mm(layer.ffn_down_shexp, cur);
+        }
+    }
+
+    cur = ggml_swiglu_split(ctx0, cur, tmp);
+    cb(cur, "ffn_swiglu", il);
+
+    return build_lora_mm(layer.ffn_down_shexp, cur);
 }
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
@@ -1353,11 +1716,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 selected_experts);
         cb(moe_out, "ffn_moe_out", il);
 
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        ggml_tensor * ffn_shexp = build_ffn_shexp(cur, layer, il);
         cb(ffn_shexp, "ffn_shexp", il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
@@ -1504,11 +1863,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             il);
     cb(moe_out, "mtp_ffn_moe_out", il);
 
-    ggml_tensor * ffn_shexp = build_ffn(cur,
-            layer.ffn_up_shexp, nullptr, nullptr,
-            layer.ffn_gate_shexp, nullptr, nullptr,
-            layer.ffn_down_shexp, nullptr, nullptr,
-            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+    ggml_tensor * ffn_shexp = build_ffn_shexp(cur, layer, il);
     cb(ffn_shexp, "mtp_ffn_shexp", il);
 
     cur = ggml_add(ctx0, moe_out, ffn_shexp);

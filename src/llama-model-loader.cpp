@@ -1040,39 +1040,40 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+struct ggml_context * llama_model_loader::ctx_for_buft(const llama_hparams & hparams, ggml_backend_buffer_type_t buft) {
+    auto it = ctx_map.find(buft);
+    if (it == ctx_map.end()) {
+        // one ggml context per buffer type
+        int max_n_tensors = n_tensors;
+        max_n_tensors += 1;                   // duplicated output tensor
+        max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+        max_n_tensors += hparams.n_layer_all*4; // synthetic (e.g. runtime-merged) tensors
+        if (files.empty()) {
+            max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
+        }
+        const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ ctx_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            throw std::runtime_error(format("failed to create ggml context"));
+        }
+
+        ctx_map.emplace(buft, ctx);
+
+        return ctx;
+    }
+    return it->second.get();
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
-        if (it == ctx_map.end()) {
-            // one ggml context per buffer type
-            int max_n_tensors = n_tensors;
-            max_n_tensors += 1;                   // duplicated output tensor
-            max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
-            if (files.empty()) {
-                max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
-            }
-            const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
-
-            ggml_init_params params = {
-                /*.mem_size   =*/ ctx_size,
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                throw std::runtime_error(format("failed to create ggml context"));
-            }
-
-            ctx_map.emplace(buft, ctx);
-
-            return ctx;
-        }
-        return it->second.get();
-    };
-
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
             if (flags & TENSOR_NOT_REQUIRED) {
@@ -1099,7 +1100,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // skip unused tensors
         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            if (!(flags & TENSOR_SKIP_QUIET)) {
+                LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            }
 
             size_data -= nbytes;
             n_created++;
@@ -1240,7 +1243,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(hparams, buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
         return ret;
@@ -1251,7 +1254,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
     }
-    ggml_context * ctx = ctx_for_buft(buft);
+    ggml_context * ctx = ctx_for_buft(hparams, buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
@@ -1278,6 +1281,57 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     } else {
         n_created++;
     }
+
+    return tensor;
+}
+
+struct ggml_tensor * llama_model_loader::create_tensor_synthetic(
+        const llama_hparams & hparams, const buft_list_t * buft_list_layer,
+        llm_tensor tn_tensor, const std::string & name, ggml_type type, const std::vector<int64_t> & ne) {
+    GGML_ASSERT(buft_list_layer != nullptr);
+
+    // synthetic tensors are only supported for repeating-layer weights
+    llm_tensor_info info;
+    try {
+        info = llm_tensor_info_for(tn_tensor);
+    } catch (const std::out_of_range & e) {
+        LLAMA_LOG_DEBUG("%s: no tensor info mapping for synthetic tensor %s\n", __func__, name.c_str());
+        return nullptr;
+    }
+    if (info.layer != LLM_TENSOR_LAYER_REPEATING || info.op == GGML_OP_NONE) {
+        LLAMA_LOG_DEBUG("%s: synthetic tensor %s is not a repeating-layer weight\n", __func__, name.c_str());
+        return nullptr;
+    }
+
+    ggml_tensor t_meta;
+    memset(&t_meta, 0, sizeof(ggml_tensor));
+    t_meta.type = type;
+    for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+        t_meta.ne[dim] = dim < ne.size() ? ne[dim] : 1;
+        if (t_meta.ne[dim] < 1) {
+            return nullptr;
+        }
+    }
+    // same stride computation as ggml_new_tensor_impl: quantized types are packed in blocks,
+    // so nb[1] is the row size, not ne[0]*type_size
+    t_meta.nb[0] = ggml_type_size(type);
+    t_meta.nb[1] = ggml_row_size(type, t_meta.ne[0]);
+    for (size_t dim = 2; dim < GGML_MAX_DIMS; dim++) {
+        t_meta.nb[dim] = t_meta.ne[dim-1]*t_meta.nb[dim-1];
+    }
+    ggml_set_name(&t_meta, name.c_str());
+
+    ggml_backend_buffer_type_t buft = select_weight_buft(hparams, &t_meta, info.op, buft_list_layer);
+    if (!buft) {
+        LLAMA_LOG_DEBUG("%s: failed to find a compatible buffer type for synthetic tensor %s\n", __func__, name.c_str());
+        return nullptr;
+    }
+
+    ggml_context * ctx = ctx_for_buft(hparams, buft);
+
+    // note: intentionally not counted towards n_created - this tensor does not exist in the model file
+    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+    ggml_set_name(tensor, name.c_str());
 
     return tensor;
 }

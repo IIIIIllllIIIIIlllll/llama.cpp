@@ -9,7 +9,8 @@ flash attention 开、f16 KV cache 的实测。
 ## 硬件包线
 
 - 内存带宽：理论 256 GB/s，实际可用 ~200 GB/s（CPU 与 GPU 共享）
-- 算力：40 CU RDNA 3.5 核显，RDNA 上 head size > 128 没有可用的 MMA 快路径
+- 算力：40 CU RDNA 3.5 核显。RDNA 上的 MMA 快路径正在扩展到 head size 128
+  以上（实验性，见 Prefill 一节），性能数据待 gfx1151 远程实测
 - 内存容量：共 122 GB，模型按量化不同 84-96 GB
 
 ## Decode（tg ~15 t/s）：带宽封顶，理论 ~27 t/s
@@ -27,7 +28,10 @@ flash attention 开、f16 KV cache 的实测。
   调用（MLA 的 LoRA 分解 wq_a/wq_b、8 组输出投影、indexer 投影、压缩器更新），
   这些小 kernel 是 launch/占用率受限，不是带宽受限。
 - 稀疏 indexer + CSA/HCA 压缩器每层每 token 还有几十个小算子，并随上下文
-  深度增长（tg 15.3 @ d=0 -> 13.4 @ d=16k）。
+  深度增长（tg 15.3 @ d=0 -> 13.4 @ d=16k）。lightning indexer 打分 kernel
+  新增 RDNA3 WMMA 路径（每步 MMA 处理 16 heads x 32 KV 向量，量化 K 在
+  shared memory 中反量化为 half），不再只有标量 vector kernel；性能数据
+  待远程实测。
 
 实测无效的方向：
 
@@ -39,6 +43,27 @@ flash attention 开、f16 KV cache 的实测。
 - MTP 投机解码（PR #25784，已验证可用）：draft 模型共享同一带宽，每步起草
   都要读 embedding + output head，收益被吃光，净 +3%。
 
+## 加载时合并 dense GEMV
+
+针对每 token ~320 次小 GEMV launch 的问题：把共享同一输入的多个投影矩阵在
+模型加载时沿输出维拼接成一个合成权重张量，图里每组只发一次 `ggml_mul_mat`，
+再用物化 view（`ggml_cont`，下游 norm/reshape 要求连续输入）切出各块结果。
+GGUF 文件不变，纯运行时变换。每层的分组（以 UD-IQ3_XXS 的实际量化类型为准）：
+
+- 组 A（输入 = attn_norm 输出）：HCA 层 `[wkv, comp_wkv, comp_wgate]`（3 -> 1 次
+  GEMV）；CSA 层再加 `[lid_comp_wkv, lid_comp_wgate]`（5 -> 1）。wq_a（Q6_K）与
+  indexer_proj（F32）类型与其他成员（Q8_0）不一致，保持分离张量；raw 层仅
+  wkv 一个成员，不合并。
+- 组 B（输入 = rms_norm(wq_a) 输出，仅 CSA 层）：`[wq_b, indexer_attn_q_b]`
+  （2 -> 1，均为 Q8_0）。
+- 组 C（输入 = ffn_norm 输出）：`[ffn_gate_shexp, ffn_up_shexp]`（2 -> 1，均为
+  Q6_K）；切出的 gate/up 仍按各自区间做 swiglu clamp。
+
+合并以组为单位，任一前提不满足就静默回退到分离张量：mmap 加载模式（合并
+需要可写 staging，必须 `-lm none`/`dio`——本平台本来就要求）、源张量缺失或
+量化类型/行长不一致、源张量带 NVFP4 sidecar scale、或用户 `-ot` 正则命中了
+原始张量名。加载旧 GGUF 行为完全一致，只是 kernel 更少。
+
 ## Prefill（pp ~230-240 t/s）：算力封顶
 
 Prefill 每批只读一遍权重，带宽被摊薄，瓶颈在 40 CU 的算力。两个要点：
@@ -46,9 +71,12 @@ Prefill 每批只读一遍权重，带宽被摊薄，瓶颈在 40 CU 的算力�
 - MMQ 配置在 gfx1151 上影响很大：128 线程 / I=64 比上游的 256 线程 / I=128
   表快 46%（pp512，小 LLC 的寄存器压力）。MoE expert dispatch 还需要把
   MMQ tile 的 J 上限压到 48 避免回退。
-- MLA 注意力 head size 为 512，而 RDNA 上 MMA flash-attention 只覆盖
-  head size <= 128，D=512 只能走标量 TILE kernel，开销随深度增长
-  （pp512 231 @ d=0 -> 136 @ d=16k）。
+- MLA 注意力 head size 为 512。RDNA 上 MMA flash-attention 只覆盖
+  head size <= 128，D=512 只能走标量 TILE kernel（开销随深度增长，
+  pp512 231 @ d=0 -> 136 @ d=16k）。曾实验性放开 DKQ=512 的 RDNA WMMA
+  路径（Q_in_reg=false，多组配置），实测在 gfx1151 上比 TILE 更慢
+  （512 宽累加器导致寄存器 spill），已整体回退；TILE kernel 仍是
+  prefill 瓶颈。
 
 ## 内存容量约束
 
@@ -69,6 +97,16 @@ Prefill 每批只读一遍权重，带宽被摊薄，瓶颈在 40 CU 的算力�
 
 参照：朴素 mmap 配置完全无法运行（SVM 死锁）；`-ncmoe 43` CPU-MoE 配置：
 tg 8.7，pp512 105。
+
+叠加本分支后续两项优化（lightning indexer RDNA3 WMMA 路径 + 加载时合并
+dense GEMV；D=512 FA MMA 路径实测更慢已回退）后，IQ3_XXS 的实测为：
+
+| 测试 | 基线 | 优化后 | 变化 |
+|---|---|---|---|
+| pp512 | 211 | 218 | +3.4% |
+| tg128 | 15.3 | 16.0 | +4.8% |
+| pp512@16k | 136 | 148 | +9.0% |
+| tg128@16k | 13.4 | 14.1 | +5.2% |
 
 ## 结论
 

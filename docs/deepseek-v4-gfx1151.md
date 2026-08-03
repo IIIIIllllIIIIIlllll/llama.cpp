@@ -9,7 +9,9 @@ attention on, f16 KV cache.
 ## Hardware envelope
 
 - Memory bandwidth: 256 GB/s theoretical, ~200 GB/s realistic (shared between CPU and GPU)
-- Compute: 40 CU RDNA 3.5 iGPU, no fast MMA path for head size > 128 on RDNA
+- Compute: 40 CU RDNA 3.5 iGPU. The MMA fast paths on RDNA are being extended
+  beyond head size 128 (experimental, see the prefill section); performance data
+  pending remote measurement on gfx1151
 - Memory capacity: 122 GB total, model is 84-96 GB depending on quant
 
 ## Decode (tg ~15 t/s): bandwidth-capped at ~27 t/s
@@ -28,7 +30,10 @@ The gap is not one big thing:
   indexer projections, compressor updates). These small kernels are launch and
   occupancy bound, not bandwidth bound.
 - The sparse indexer + CSA/HCA compressor add dozens of small ops per layer per token,
-  scaling with context depth (tg 15.3 @ d=0 -> 13.4 @ d=16k).
+  scaling with context depth (tg 15.3 @ d=0 -> 13.4 @ d=16k). The lightning indexer
+  score kernel now has an RDNA3 WMMA path (16 heads x 32 KV vectors per MMA step,
+  quantized K dequantized to half in shared memory) instead of the scalar vector
+  kernel only; performance data pending remote measurement.
 
 Things that do NOT help (measured):
 
@@ -40,6 +45,31 @@ Things that do NOT help (measured):
 - MTP speculative decoding (PR #25784, verified working): the draft model shares the
   same bandwidth; embedding + output-head reads per draft step eat the win. +3%.
 
+## Load-time merged dense GEMV
+
+To attack the ~320 small GEMV launches per token, projections that share the same
+input are concatenated along the output dimension at model load time into one
+synthetic weight tensor, so the graph issues a single `ggml_mul_mat` per group and
+slices the result with materialized views (`ggml_cont`; downstream norm/reshape
+ops require contiguous inputs). The GGUF file is unchanged; this is a pure runtime
+transform. Groups per layer (for the UD-IQ3_XXS quant types):
+
+- Group A (input = attn_norm output): HCA layers `[wkv, comp_wkv, comp_wgate]`
+  (3 -> 1 GEMV); CSA adds `[lid_comp_wkv, lid_comp_wgate]` (5 -> 1). wq_a (Q6_K)
+  and indexer_proj (F32) use different types than the Q8_0 members and stay
+  separate; raw layers have only wkv, so nothing to merge.
+- Group B (input = rms_norm(wq_a) output, CSA only): `[wq_b, indexer_attn_q_b]`
+  (2 -> 1, both Q8_0).
+- Group C (input = ffn_norm output): `[ffn_gate_shexp, ffn_up_shexp]` (2 -> 1,
+  both Q6_K); the gate/up slices keep their distinct swiglu clamp limits.
+
+The merge is per-group and falls back silently to the separate tensors when any
+precondition fails: mmap load mode (the merge needs writable staging, so `-lm none`
+/`dio` — already required on this platform), a source tensor missing or having a
+different quant type / row length, per-source NVFP4 sidecar scales, or a user `-ot`
+override matching one of the original tensor names. Loading an old GGUF therefore
+behaves identically, just with fewer kernels.
+
 ## Prefill (pp ~230-240 t/s): compute-capped
 
 Prefill reads each weight once per batch, so bandwidth amortizes; the limit is the
@@ -48,9 +78,13 @@ Prefill reads each weight once per batch, so bandwidth amortizes; the limit is t
 - MMQ config matters a lot on gfx1151: 128 threads / I=64 beats the upstream
   256 threads / I=128 table by +46% at pp512 (register pressure on the small LLC).
   For MoE expert dispatch, capping the MMQ tile J at 48 avoids a regression.
-- MLA attention has head size 512. On RDNA, MMA flash-attention kernels only cover
-  head size <= 128, so D=512 runs the scalar TILE kernel. Cost grows with context
-  depth (pp512 231 @ d=0 -> 136 @ d=16k).
+- MLA attention has head size 512. The MMA flash-attention kernels on RDNA only
+  cover head size <= 128, so D=512 runs the scalar TILE kernel (cost grows with
+  context depth, pp512 231 @ d=0 -> 136 @ d=16k). Enabling the RDNA WMMA path for
+  DKQ=512 was tested (Q_in_reg=false, several config variants) and measured
+  *slower* than the TILE kernel on gfx1151 (register spills with 512-wide
+  accumulators), so it stays disabled; the TILE kernel remains the prefill
+  bottleneck.
 
 ## Memory capacity constraint
 
@@ -72,6 +106,17 @@ Config: full GPU offload, `-lm none`, FA on, RDNA3.5 MMQ tuning
 
 Reference points: naive mmap config does not run at all (SVM livelock);
 `-ncmoe 43` CPU-MoE config: tg 8.7, pp512 105.
+
+With the two follow-up optimizations of this branch on top (lightning indexer
+RDNA3 WMMA path + load-time merged dense GEMV; the D=512 FA MMA path measured
+slower and was reverted), IQ3_XXS measures:
+
+| test | baseline | optimized | change |
+|---|---|---|---|
+| pp512 | 211 | 218 | +3.4% |
+| tg128 | 15.3 | 16.0 | +4.8% |
+| pp512 @ d=16k | 136 | 148 | +9.0% |
+| tg128 @ d=16k | 13.4 | 14.1 | +5.2% |
 
 ## Bottom line
 
