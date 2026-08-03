@@ -9,8 +9,8 @@ flash attention 开、f16 KV cache 的实测。
 ## 硬件包线
 
 - 内存带宽：理论 256 GB/s，实际可用 ~200 GB/s（CPU 与 GPU 共享）
-- 算力：40 CU RDNA 3.5 核显。RDNA 上的 MMA 快路径正在扩展到 head size 128
-  以上（实验性，见 Prefill 一节），性能数据待 gfx1151 远程实测
+- 算力：40 CU RDNA 3.5 核显。本分支把 RDNA 的 MMA 快路径扩展到了 head
+  size 128 以上（见 Prefill 一节）
 - 内存容量：共 122 GB，模型按量化不同 84-96 GB
 
 ## Decode（tg ~15 t/s）：带宽封顶，理论 ~27 t/s
@@ -30,8 +30,7 @@ flash attention 开、f16 KV cache 的实测。
 - 稀疏 indexer + CSA/HCA 压缩器每层每 token 还有几十个小算子，并随上下文
   深度增长（tg 15.3 @ d=0 -> 13.4 @ d=16k）。lightning indexer 打分 kernel
   新增 RDNA3 WMMA 路径（每步 MMA 处理 16 heads x 32 KV 向量，量化 K 在
-  shared memory 中反量化为 half），不再只有标量 vector kernel；性能数据
-  待远程实测。
+  shared memory 中反量化为 half），不再只有标量 vector kernel。
 
 实测无效的方向：
 
@@ -63,6 +62,27 @@ GGUF 文件不变，纯运行时变换。每层的分组（以 UD-IQ3_XXS 的实
 需要可写 staging，必须 `-lm none`/`dio`——本平台本来就要求）、源张量缺失或
 量化类型/行长不一致、源张量带 NVFP4 sidecar scale、或用户 `-ot` 正则命中了
 原始张量名。加载旧 GGUF 行为完全一致，只是 kernel 更少。
+
+## 投机解码（DSpark / MTP 草稿）
+
+DSV4 的 DSpark 草稿实测可用：tg 16.0 -> 19.8（+24%，ctx 8192，temp 0）。
+要点：
+
+- 部分 DSV4 DSpark GGUF 缺 `token_embd.weight`/`output.weight`（转换不完整；
+  上游 `conversion/` 只有 Qwen3 backbone 的 DSpark 转换路径）。此时草稿经
+  `ctx_other` 引用主模型张量：不加 `--fit on` 会触发 ggml 调度器断言
+  （pre-allocated tensor ... cannot run the operation），加 `--fit on` 则正常
+  且性能无损（fit 只改 buffer 布局，基线与 DSpark 实测 fit on/off 均一致）。
+  本分支的 dflash 加载器支持 GGUF 自带这两个张量（可选张量，缺失时维持
+  原行为），可用 `scripts/gguf-inject-tensors.py` 从 MTP GGUF 注入补齐——
+  自包含后不依赖 `--fit`。
+- `--spec-draft-n-max` 保持默认 3：n_max=4 掉到 17.0，n_max=5 掉到 14.1
+  （草稿 block_size=5，更大的块浪费草稿算力）。
+- 草稿可放第二块显卡（实测 RTX 2080 Ti / CUDA sm_75）：速度与本机相同
+  （19.8 vs 19.9 t/s，隐状态经 host 内存交换，开销可忽略），但省下 ~12 GB
+  统一内存。需要 `GGML_BACKEND_DL=ON` 的 CUDA+HIP 双后端构建
+  （两库导出同名符号，必须运行时 dlopen 隔离）、自包含草稿 GGUF、
+  `--spec-draft-device CUDA0`。MTP-Q8_0 草稿同法可用：tg 16.0 -> 18.2。
 
 ## Prefill（pp ~230-240 t/s）：算力封顶
 

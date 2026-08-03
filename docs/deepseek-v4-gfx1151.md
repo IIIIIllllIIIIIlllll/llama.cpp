@@ -69,6 +69,32 @@ different quant type / row length, per-source NVFP4 sidecar scales, or a user `-
 override matching one of the original tensor names. Loading an old GGUF therefore
 behaves identically, just with fewer kernels.
 
+## Speculative decoding (DSpark / MTP drafts)
+
+The DSV4 DSpark draft works: tg 16.0 -> 19.8 t/s (+24%, ctx 8192, temp 0).
+Notes:
+
+- Some DSV4 DSpark GGUFs lack `token_embd.weight`/`output.weight` (incomplete
+  conversion; upstream `conversion/` only has a Qwen3-backbone DSpark path).
+  The draft then references the target's tensors via `ctx_other`: without
+  `--fit on` the ggml scheduler aborts ("pre-allocated tensor ... cannot run
+  the operation"); with `--fit on` it works with no performance cost (fit only
+  changes buffer placement; baseline and DSpark measure identically with fit
+  on/off). The dflash loader in this branch also accepts self-contained GGUFs
+  carrying those two tensors (optional; old files behave as before) — inject
+  them from the MTP GGUF with `scripts/gguf-inject-tensors.py` and `--fit`
+  is no longer required.
+- Keep `--spec-draft-n-max` at the default 3: n_max=4 drops to 17.0 t/s and
+  n_max=5 to 14.1 t/s (the draft block_size is 5; larger blocks waste draft
+  compute).
+- The draft can run on a second GPU (measured: RTX 2080 Ti / CUDA sm_75) at
+  the same speed as on-device (19.8 vs 19.9 t/s — hidden states cross via host
+  memory, negligible cost), freeing ~12 GB of unified memory. Requires a
+  CUDA+HIP dual-backend build with `GGML_BACKEND_DL=ON` (both libs export the
+  same symbol, so runtime dlopen isolation is mandatory), a self-contained
+  draft GGUF, and `--spec-draft-device CUDA0`. The MTP-Q8_0 draft works the
+  same way: tg 16.0 -> 18.2 t/s.
+
 ## Prefill (pp ~230-240 t/s): compute-capped
 
 Prefill reads each weight once per batch, so bandwidth amortizes; the limit is the
