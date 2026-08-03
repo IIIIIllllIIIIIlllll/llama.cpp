@@ -6824,9 +6824,10 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
+    const bool v_is_k_view; // make V a view of K (MLA-style K == V data reuse), requires hsk == hsv
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, v_is_k_view);
     }
 
     double max_nmse_err() override {
@@ -6842,9 +6843,10 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                        bool v_is_k_view = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute) {}
+          type_K(type_K), type_V(type_V), permute(permute), v_is_k_view(v_is_k_view) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -6876,8 +6878,8 @@ struct test_flash_attn_ext : public test_case {
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
-        if (type_K == type_V && hsk_padded == 576 && hsv_padded == 512) {
-            // TODO: this branch should become a separate test case parameter instead of hardcoding this for these head shapes
+        if (type_K == type_V && ((hsk_padded == 576 && hsv_padded == 512) || (v_is_k_view && hsk_padded == hsv_padded))) {
+            // TODO: the 576/512 branch should become a separate test case parameter instead of hardcoding this for these head shapes
 
             // in this branch, the V cache is sub-view of the K cache. this is used by some MLA-based models
             // for more info:
@@ -9600,6 +9602,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, 512, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // DeepSeek-V4 MLA geometry (DKQ = DV = 512, V is a view of K, large GQA ratio, prefill shapes):
+    // exercises the RDNA3 WMMA fattn kernel on HIP/gfx11 (warp split along DV, P in shared memory),
+    // and the generic V_is_K_view code paths on all other backends.
+    for (int64_t kv : { 512, 4096, 16384 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 8, {8, 1}, kv, 32, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 8, {8, 1}, kv, 32, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+                                                        {0, 1, 2, 3}, true));
+    }
+
+    // Same with attention sinks (DeepSeek-V4 uses sinks), exercises the sinks path of the RDNA3 kernel:
+    for (int64_t kv : { 512, 16384 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 8, {8, 1}, kv, 32, true, true, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+                                                        {0, 1, 2, 3}, true));
     }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));

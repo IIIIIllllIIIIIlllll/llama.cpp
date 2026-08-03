@@ -75,8 +75,12 @@ Prefill 每批只读一遍权重，带宽被摊薄，瓶颈在 40 CU 的算力�
   head size <= 128，D=512 只能走标量 TILE kernel（开销随深度增长，
   pp512 231 @ d=0 -> 136 @ d=16k）。曾实验性放开 DKQ=512 的 RDNA WMMA
   路径（Q_in_reg=false，多组配置），实测在 gfx1151 上比 TILE 更慢
-  （512 宽累加器导致寄存器 spill），已整体回退；TILE kernel 仍是
-  prefill 瓶颈。
+  （512 宽累加器导致寄存器 spill），已整体回退。
+  最终方案是针对 DKQ=DV=512 且 K==V 的 RDNA3 专用 WMMA kernel
+  （`fattn-mma-d512-rdna.cuh`）：PV 阶段 warp 沿 DV 分工（每 warp 只持有
+  256 宽累加器切片，避免 spill）+ P 物化 shared + K==V 复用 tile，
+  支持 attention sinks，对 MLA prefill 形状启用 dispatch。
+  实测 pp512 218 -> 230（+5.5%），pp512@16k 148 -> 176（+18.7%）。
 
 ## 内存容量约束
 
@@ -98,14 +102,14 @@ Prefill 每批只读一遍权重，带宽被摊薄，瓶颈在 40 CU 的算力�
 参照：朴素 mmap 配置完全无法运行（SVM 死锁）；`-ncmoe 43` CPU-MoE 配置：
 tg 8.7，pp512 105。
 
-叠加本分支后续两项优化（lightning indexer RDNA3 WMMA 路径 + 加载时合并
-dense GEMV；D=512 FA MMA 路径实测更慢已回退）后，IQ3_XXS 的实测为：
+叠加本分支后续三项优化（lightning indexer RDNA3 WMMA 路径 + 加载时合并
+dense GEMV + D=512 RDNA3 专用 WMMA fattn kernel）后，IQ3_XXS 的实测为：
 
 | 测试 | 基线 | 优化后 | 变化 |
 |---|---|---|---|
-| pp512 | 211 | 218 | +3.4% |
+| pp512 | 211 | 230 | +9.0% |
 | tg128 | 15.3 | 16.0 | +4.8% |
-| pp512@16k | 136 | 148 | +9.0% |
+| pp512@16k | 136 | 176 | +29.1% |
 | tg128@16k | 13.4 | 14.1 | +5.2% |
 
 ## 结论

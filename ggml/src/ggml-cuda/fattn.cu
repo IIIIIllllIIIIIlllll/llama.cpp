@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-d512-rdna.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -329,10 +330,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
-    BEST_FATTN_KERNEL_VEC     = 100,
-    BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_NONE          =   0,
+    BEST_FATTN_KERNEL_TILE          = 200,
+    BEST_FATTN_KERNEL_VEC           = 100,
+    BEST_FATTN_KERNEL_MMA_F16       = 400,
+    BEST_FATTN_KERNEL_MMA_D512_RDNA = 500,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -488,6 +490,30 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
+#if defined(GGML_USE_HIP)
+    // RDNA3 (e.g. gfx1151): dedicated WMMA kernel for DKQ = DV = 512 with V being a view of K
+    // (DeepSeek-V4 MLA prefill). Requires GQA optimizations, an f16 mask, and no softcap.
+    {
+        float logit_softcap = 0.0f;
+        memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
+        const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+        if (amd_wmma_available(cc) && GGML_CUDA_CC_IS_RDNA3(cc) && Q->ne[0] == 512 && V->ne[0] == 512) {
+            static const bool debug = getenv("GGML_FATTN_D512_DEBUG") != nullptr;
+            const bool cond = gqa_opt_applies && V_is_K_view && Q->ne[1]*gqa_ratio_eff > 8 &&
+                    logit_softcap == 0.0f;
+            if (debug) {
+                fprintf(stderr, "%s: D=512 fattn: gqa_opt=%d V_is_K_view=%d ne1*gqa=%d softcap=%f sinks=%d -> %s\n",
+                        __func__, (int) gqa_opt_applies, (int) V_is_K_view, (int) (Q->ne[1]*gqa_ratio_eff),
+                        logit_softcap, (int) (dst->src[4] != nullptr), cond ? "MMA_D512_RDNA" : "fallback");
+            }
+            if (cond) {
+                return BEST_FATTN_KERNEL_MMA_D512_RDNA;
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
@@ -553,6 +579,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = true;
             need_f16_V = true;
             break;
+        case BEST_FATTN_KERNEL_MMA_D512_RDNA:
+            // V is a view of K and shares the (converted) K data:
+            need_f16_K = true;
+            need_f16_V = false;
+            break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
@@ -580,6 +611,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_D512_RDNA:
+            ggml_cuda_flash_attn_ext_mma_d512_rdna(ctx, dst);
             break;
     }
 }

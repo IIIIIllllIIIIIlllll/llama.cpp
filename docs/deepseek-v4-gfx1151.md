@@ -9,9 +9,8 @@ attention on, f16 KV cache.
 ## Hardware envelope
 
 - Memory bandwidth: 256 GB/s theoretical, ~200 GB/s realistic (shared between CPU and GPU)
-- Compute: 40 CU RDNA 3.5 iGPU. The MMA fast paths on RDNA are being extended
-  beyond head size 128 (experimental, see the prefill section); performance data
-  pending remote measurement on gfx1151
+- Compute: 40 CU RDNA 3.5 iGPU. The MMA fast paths on RDNA are extended beyond
+  head size 128 by this branch (see the prefill section)
 - Memory capacity: 122 GB total, model is 84-96 GB depending on quant
 
 ## Decode (tg ~15 t/s): bandwidth-capped at ~27 t/s
@@ -33,7 +32,7 @@ The gap is not one big thing:
   scaling with context depth (tg 15.3 @ d=0 -> 13.4 @ d=16k). The lightning indexer
   score kernel now has an RDNA3 WMMA path (16 heads x 32 KV vectors per MMA step,
   quantized K dequantized to half in shared memory) instead of the scalar vector
-  kernel only; performance data pending remote measurement.
+  kernel only.
 
 Things that do NOT help (measured):
 
@@ -83,8 +82,13 @@ Prefill reads each weight once per batch, so bandwidth amortizes; the limit is t
   context depth, pp512 231 @ d=0 -> 136 @ d=16k). Enabling the RDNA WMMA path for
   DKQ=512 was tested (Q_in_reg=false, several config variants) and measured
   *slower* than the TILE kernel on gfx1151 (register spills with 512-wide
-  accumulators), so it stays disabled; the TILE kernel remains the prefill
-  bottleneck.
+  accumulators), so it stays disabled.
+  The final solution is a dedicated RDNA3 WMMA kernel for DKQ=DV=512 with K==V
+  (`fattn-mma-d512-rdna.cuh`): warps split along DV for P*V (each warp holds
+  only a 256-wide accumulator slice, no spills) + P materialized in shared
+  memory + the K tile reused as V. Attention sinks are supported and the kernel
+  is dispatched for the MLA prefill shape. Measured: pp512 218 -> 230 (+5.5%),
+  pp512@16k 148 -> 176 (+18.7%).
 
 ## Memory capacity constraint
 
@@ -107,15 +111,15 @@ Config: full GPU offload, `-lm none`, FA on, RDNA3.5 MMQ tuning
 Reference points: naive mmap config does not run at all (SVM livelock);
 `-ncmoe 43` CPU-MoE config: tg 8.7, pp512 105.
 
-With the two follow-up optimizations of this branch on top (lightning indexer
-RDNA3 WMMA path + load-time merged dense GEMV; the D=512 FA MMA path measured
-slower and was reverted), IQ3_XXS measures:
+With the three follow-up optimizations of this branch on top (lightning indexer
+RDNA3 WMMA path + load-time merged dense GEMV + dedicated D=512 RDNA3 WMMA
+fattn kernel), IQ3_XXS measures:
 
 | test | baseline | optimized | change |
 |---|---|---|---|
-| pp512 | 211 | 218 | +3.4% |
+| pp512 | 211 | 230 | +9.0% |
 | tg128 | 15.3 | 16.0 | +4.8% |
-| pp512 @ d=16k | 136 | 148 | +9.0% |
+| pp512 @ d=16k | 136 | 176 | +29.1% |
 | tg128 @ d=16k | 13.4 | 14.1 | +5.2% |
 
 ## Bottom line
